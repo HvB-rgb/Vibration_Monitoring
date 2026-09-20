@@ -1,0 +1,7 @@
+# Compiled firmware output (regenerate with arduino-cli compile)
+build/
+sketch/build/
+machine_room_node/sketch/build/
+
+# macOS
+.DS_Store

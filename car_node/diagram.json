@@ -1,0 +1,63 @@
+{
+  "version": 1,
+  "author": "Ishaan Bharadwaj",
+  "editor": "wokwi",
+  "parts": [
+    {
+      "id": "esp",
+      "type": "board-esp32-devkit-c-v4",
+      "top": 0,
+      "left": 0,
+      "attrs": {}
+    },
+    {
+      "id": "mpu",
+      "type": "wokwi-mpu6050",
+      "top": -60,
+      "left": 260,
+      "attrs": {}
+    },
+    {
+      "id": "rtc",
+      "type": "wokwi-ds1307",
+      "top": 60,
+      "left": 260,
+      "attrs": {}
+    },
+    {
+      "id": "sd",
+      "type": "wokwi-microsd-card",
+      "top": 180,
+      "left": 260,
+      "attrs": {}
+    },
+    {
+      "id": "btn",
+      "type": "wokwi-pushbutton",
+      "top": 300,
+      "left": 260,
+      "attrs": { "color": "red" }
+    }
+  ],
+  "connections": [
+    ["esp:3V3", "mpu:VCC", "red", []],
+    ["esp:GND", "mpu:GND", "black", []],
+    ["esp:21", "mpu:SDA", "green", []],
+    ["esp:22", "mpu:SCL", "yellow", []],
+
+    ["esp:3V3", "rtc:5V", "red", []],
+    ["esp:GND", "rtc:GND", "black", []],
+    ["esp:21", "rtc:SDA", "green", []],
+    ["esp:22", "rtc:SCL", "yellow", []],
+
+    ["esp:3V3", "sd:VCC", "red", []],
+    ["esp:GND", "sd:GND", "black", []],
+    ["esp:18", "sd:SCK", "blue", []],
+    ["esp:23", "sd:DI", "orange", []],
+    ["esp:19", "sd:DO", "purple", []],
+    ["esp:5", "sd:CS", "gray", []],
+
+    ["esp:4", "btn:1.l", "green", []],
+    ["esp:GND", "btn:2.l", "black", []]
+  ]
+}
