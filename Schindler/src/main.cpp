@@ -128,14 +128,22 @@ void setup() {
   }
 
   // --- SD card ---
-  // NOTE: The ESP32 SD library only supports FAT16 / FAT32.
-  //       64 GB cards ship as exFAT — you MUST reformat to FAT32 first!
-  //       Linux:   sudo mkfs.vfat -F 32 /dev/sdX1
-  //       Windows: use "SD Card Formatter" app, or guiformat.exe for >32 GB
-  if (!SD.begin(SD_CS_PIN)) {
+  // Explicitly configure SPI pins for ESP32 VSPI
+  SPI.begin(18, 19, 23, SD_CS_PIN);
+  pinMode(SD_CS_PIN, OUTPUT);
+  digitalWrite(SD_CS_PIN, HIGH);
+
+  // Try standard 4 MHz, fallback to 1 MHz for jumper wire stability
+  bool sdOk = SD.begin(SD_CS_PIN, SPI, 4000000);
+  if (!sdOk) {
+    delay(100);
+    sdOk = SD.begin(SD_CS_PIN, SPI, 1000000); // 1 MHz fallback
+  }
+
+  if (!sdOk) {
     Serial.println("!!! SD card init FAILED !!!");
-    Serial.println("    → Is the card inserted?");
-    Serial.println("    → Is it formatted as FAT32?  (exFAT won't work!)");
+    Serial.println("    → If module has a 3.3V regulator chip, wire VCC to 5V/VIN (not 3V3)!");
+    Serial.println("    → Confirm card was formatted as FAT32: sudo mkfs.vfat -F 32 /dev/mmcblk0p1");
   } else {
     // Print diagnostics
     uint8_t cardType = SD.cardType();
@@ -232,7 +240,7 @@ void loop() {
   static unsigned long lastSdRetry = 0;
   if (!sdReady && (ms - lastSdRetry > 3000)) {
     lastSdRetry = ms;
-    if (SD.begin(SD_CS_PIN)) {
+    if (SD.begin(SD_CS_PIN, SPI, 1000000)) {
       logFile = SD.open(LOG_FILENAME, FILE_APPEND);
       if (logFile) {
         sdReady = true;
