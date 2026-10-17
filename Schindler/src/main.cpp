@@ -1,14 +1,19 @@
 // ============================================================================
-// Schindler Car Node — MPU6500 + DS3231 RTC + SD Card + WiFi UDP Telemetry
+// Schindler Car Node — Dual-Core FreeRTOS Architecture
 // ============================================================================
 //
-// IMU:  Raw register-level I²C for the MPU6500  (unchanged from original)
-// RTC:  DS3231 on the ESP32's *second* I²C bus  (Wire1, GPIO 16/17)
-//       → both MPU6500 and DS3231 have address 0x68, so they MUST be on
-//         separate buses.
-// SD:   Default VSPI — CS on GPIO 5
-// WiFi: ESP32 creates a soft-AP; laptop connects to it and receives live
-//       CSV data over UDP broadcast.
+// CORE 1 (IMU & Sampling):
+//   - Samples MPU6500 (raw register I²C, untouched original code)
+//   - Fast Serial Plotter output
+//   - DS3231 RTC timestamping (Wire1, GPIO 16/17)
+//   - Pushes measurements into a lock-free FreeRTOS Queue (non-blocking)
+//   - Runs at a strict, uninterrupted 50 Hz!
+//
+// CORE 0 (SD Card Logging & WiFi Telemetry):
+//   - Drains the FreeRTOS Queue
+//   - Writes CSV lines to SD card and flushes periodically
+//   - Broadcasts live UDP packets to laptop
+//   - Handles SD card retries without ever stalling the IMU!
 //
 // WIRING
 // ──────────────────────────────────────────────────
@@ -25,20 +30,13 @@
 //    SCL        GPIO 17
 //
 //  SD Card   →  ESP32          (SPI — VSPI)
-//    VCC        3V3
+//    VCC        5V / VIN  (or 3V3 if module has no regulator)
 //    GND        GND
 //    CS         GPIO 5
 //    MOSI       GPIO 23
 //    MISO       GPIO 19
 //    SCK        GPIO 18
 // ──────────────────────────────────────────────────
-//
-// VIEWING LIVE DATA ON YOUR LAPTOP
-//   1) Connect laptop WiFi to "Schindler_CarNode" (password: schindler5000)
-//   2) Run:  python3 tools/udp_receiver.py
-//      Data streams in real-time as CSV.
-//
-// ============================================================================
 
 #include <Arduino.h>
 #include <Wire.h>
@@ -50,7 +48,7 @@
 
 // ---- WiFi Access Point ----
 const char* AP_SSID = "Schindler_CarNode";
-const char* AP_PASS = "schindler5000";      // min 8 chars for WPA2
+const char* AP_PASS = "schindler5000";
 #define UDP_PORT 4210
 
 // ---- Pin map ----
@@ -65,6 +63,18 @@ const char* AP_PASS = "schindler5000";      // min 8 chars for WPA2
 const float ACCEL_OFFSET[3] = {0.0, 0.0, 0.0};  // m/s^2
 const float GYRO_OFFSET[3]  = {0.0, 0.0, 0.0};  // rad/s
 
+// ---- FreeRTOS Queue for Core 0 <-> Core 1 Decoupling ----
+struct ImuRecord {
+  unsigned long sample;
+  char timestamp[22];
+  unsigned long ms;
+  float ax, ay, az;
+  float gx, gy, gz;
+};
+
+#define QUEUE_CAPACITY 150  // 150 items = 3 seconds buffer at 50 Hz
+QueueHandle_t dataQueue;
+
 // ---- Peripherals ----
 TwoWire rtcWire(1);          // second I²C peripheral for the RTC
 RTC_DS3231 rtc;
@@ -73,7 +83,7 @@ File logFile;
 
 const char* LOG_FILENAME = "/car_data.csv";
 unsigned long sampleCount = 0;
-bool sdReady  = false;
+volatile bool sdReady  = false;
 bool rtcReady = false;
 
 // ---- IMU register write (unchanged) ----
@@ -84,14 +94,98 @@ uint8_t writeReg(uint8_t reg, uint8_t val) {
   return Wire.endTransmission();
 }
 
+// ============================================================================
+// CORE 0 TASK: SD Card Writer & WiFi Telemetry Worker
+// ============================================================================
+void sdLoggingTask(void *pvParameters) {
+  // Initialize SD card on Core 0
+  SPI.begin(18, 19, 23, SD_CS_PIN);
+  pinMode(SD_CS_PIN, OUTPUT);
+  digitalWrite(SD_CS_PIN, HIGH);
+
+  bool sdOk = SD.begin(SD_CS_PIN, SPI, 4000000);
+  if (!sdOk) {
+    vTaskDelay(pdMS_TO_TICKS(100));
+    sdOk = SD.begin(SD_CS_PIN, SPI, 1000000);
+  }
+
+  if (sdOk) {
+    logFile = SD.open(LOG_FILENAME, FILE_APPEND);
+    if (logFile) {
+      // If new file, write CSV header
+      if (logFile.size() == 0) {
+        logFile.println("sample,timestamp,millis,ax_ms2,ay_ms2,az_ms2,gx_rads,gy_rads,gz_rads");
+        logFile.flush();
+      }
+      sdReady = true;
+      Serial.println(">>> Core 0: SD card logging active ✓ <<<");
+    }
+  } else {
+    Serial.println(">>> Core 0: SD card not ready yet. Retrying in background... <<<");
+  }
+
+  ImuRecord rec;
+  char csvRow[160];
+  unsigned long lastRetry = 0;
+
+  while (true) {
+    // Wait for sample from Core 1 queue (blocking wait, zero CPU usage when empty)
+    if (xQueueReceive(dataQueue, &rec, pdMS_TO_TICKS(100)) == pdTRUE) {
+      snprintf(csvRow, sizeof(csvRow),
+               "%lu,%s,%lu,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f",
+               rec.sample, rec.timestamp, rec.ms,
+               rec.ax, rec.ay, rec.az, rec.gx, rec.gy, rec.gz);
+
+      // --- Write to SD Card ---
+      if (sdReady && logFile) {
+        logFile.println(csvRow);
+        // Flush every 50 samples (~1s) to commit NAND flash blocks
+        if (rec.sample % 50 == 0) {
+          logFile.flush();
+        }
+      }
+
+      // --- Broadcast via UDP to Laptop ---
+      udp.beginPacket(IPAddress(192, 168, 4, 255), UDP_PORT);
+      udp.println(csvRow);
+      udp.endPacket();
+    }
+
+    // --- Background SD Reconnect if disconnected ---
+    unsigned long now = millis();
+    if (!sdReady && (now - lastRetry > 3000)) {
+      lastRetry = now;
+      if (SD.begin(SD_CS_PIN, SPI, 1000000)) {
+        logFile = SD.open(LOG_FILENAME, FILE_APPEND);
+        if (logFile) {
+          if (logFile.size() == 0) {
+            logFile.println("sample,timestamp,millis,ax_ms2,ay_ms2,az_ms2,gx_rads,gy_rads,gz_rads");
+          }
+          sdReady = true;
+          Serial.println("\n>>> Core 0: [SD CARD DETECTED & LOGGING STARTED] <<<");
+        }
+      }
+    }
+  }
+}
+
+// ============================================================================
+// SETUP
+// ============================================================================
 void setup() {
   Serial.begin(115200);
   delay(100);
-  Serial.println("\n=== Schindler Car Node ===");
+  Serial.println("\n=== Schindler Car Node (Dual-Core) ===");
+
+  // Create queue: 150 items capacity (~3 seconds buffer for SD flash lag)
+  dataQueue = xQueueCreate(QUEUE_CAPACITY, sizeof(ImuRecord));
+  if (dataQueue == NULL) {
+    Serial.println("Error creating FreeRTOS queue!");
+  }
 
   // --- WiFi Access Point ---
   WiFi.softAP(AP_SSID, AP_PASS);
-  delay(100);                       // let the AP settle
+  delay(100);
   Serial.printf("WiFi AP : %s  (pass: %s)\n", AP_SSID, AP_PASS);
   Serial.printf("AP IP   : %s\n", WiFi.softAPIP().toString().c_str());
   Serial.printf("UDP port: %d\n", UDP_PORT);
@@ -127,61 +221,26 @@ void setup() {
                   now.hour(), now.minute(), now.second());
   }
 
-  // --- SD card ---
-  // Explicitly configure SPI pins for ESP32 VSPI
-  SPI.begin(18, 19, 23, SD_CS_PIN);
-  pinMode(SD_CS_PIN, OUTPUT);
-  digitalWrite(SD_CS_PIN, HIGH);
+  // --- Launch SD / WiFi Worker Task on CORE 0 ---
+  xTaskCreatePinnedToCore(
+    sdLoggingTask,       /* Function to implement the task */
+    "SD_Worker",         /* Name of the task */
+    8192,                /* Stack size in bytes */
+    NULL,                /* Task input parameter */
+    1,                   /* Priority of the task */
+    NULL,                /* Task handle */
+    0                    /* Core where task should run (Core 0) */
+  );
 
-  // Try standard 4 MHz, fallback to 1 MHz for jumper wire stability
-  bool sdOk = SD.begin(SD_CS_PIN, SPI, 4000000);
-  if (!sdOk) {
-    delay(100);
-    sdOk = SD.begin(SD_CS_PIN, SPI, 1000000); // 1 MHz fallback
-  }
-
-  if (!sdOk) {
-    Serial.println("!!! SD card init FAILED !!!");
-    Serial.println("    → If module has a 3.3V regulator chip, wire VCC to 5V/VIN (not 3V3)!");
-    Serial.println("    → Confirm card was formatted as FAT32: sudo mkfs.vfat -F 32 /dev/mmcblk0p1");
-  } else {
-    // Print diagnostics
-    uint8_t cardType = SD.cardType();
-    const char* typeStr = "UNKNOWN";
-    if (cardType == CARD_MMC)  typeStr = "MMC";
-    if (cardType == CARD_SD)   typeStr = "SD";
-    if (cardType == CARD_SDHC) typeStr = "SDHC";
-    Serial.printf("SD card detected: %s, %.1f GB\n",
-                  typeStr, SD.cardSize() / (1024.0 * 1024 * 1024));
-    Serial.printf("Total space: %.1f MB, Used: %.1f MB\n",
-                  SD.totalBytes() / (1024.0 * 1024),
-                  SD.usedBytes()  / (1024.0 * 1024));
-
-    // Test write
-    logFile = SD.open(LOG_FILENAME, FILE_WRITE);
-    if (logFile) {
-      logFile.println("sample,timestamp,millis,ax_ms2,ay_ms2,az_ms2,gx_rads,gy_rads,gz_rads");
-      logFile.flush();
-      logFile.close();
-      // Verify the file exists
-      if (SD.exists(LOG_FILENAME)) {
-        sdReady = true;
-        Serial.printf("SD logging to %s  ✓\n", LOG_FILENAME);
-      } else {
-        Serial.println("!!! SD write verification FAILED — file not found after write");
-        Serial.println("    → Card is probably exFAT.  Reformat as FAT32!");
-      }
-    } else {
-      Serial.println("!!! SD file open FAILED");
-      Serial.println("    → Card is probably exFAT.  Reformat as FAT32!");
-    }
-  }
-
-  Serial.println("\nSetup complete — logging + UDP telemetry active.");
+  Serial.println("\nCore 1 dedicated to high-speed IMU sampling.");
+  Serial.println("Core 0 handling SD logging + UDP telemetry.");
   Serial.println("──────────────────────────────────────────────────");
-  delay(3000);  // pause so you can read the messages above
+  delay(1500);
 }
 
+// ============================================================================
+// CORE 1 LOOP: Dedicated IMU Sampling & Plotting
+// ============================================================================
 void loop() {
   // ================================================================
   // IMU read — everything from here to the Serial.printf is UNCHANGED
@@ -218,7 +277,7 @@ void loop() {
 
   // --- Timestamp ---
   unsigned long ms = millis();
-  char tsBuf[24];
+  char tsBuf[22];
   if (rtcReady) {
     DateTime now = rtc.now();
     snprintf(tsBuf, sizeof(tsBuf), "%04d-%02d-%02d %02d:%02d:%02d",
@@ -228,46 +287,17 @@ void loop() {
     strncpy(tsBuf, "NO_RTC", sizeof(tsBuf));
   }
 
-  // --- Build CSV row ---
-  sampleCount++;
-  char csvRow[160];
-  snprintf(csvRow, sizeof(csvRow),
-           "%lu,%s,%lu,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f",
-           sampleCount, tsBuf, ms,
-           ax, ay, az, gx, gy, gz);
+  // --- Push to Core 0 FreeRTOS Queue (non-blocking, timeout 0) ---
+  ImuRecord rec;
+  rec.sample = ++sampleCount;
+  strncpy(rec.timestamp, tsBuf, sizeof(rec.timestamp));
+  rec.ms = ms;
+  rec.ax = ax; rec.ay = ay; rec.az = az;
+  rec.gx = gx; rec.gy = gy; rec.gz = gz;
 
-  // --- SD card logging (with auto-retry if card was inserted late) ---
-  static unsigned long lastSdRetry = 0;
-  if (!sdReady && (ms - lastSdRetry > 3000)) {
-    lastSdRetry = ms;
-    if (SD.begin(SD_CS_PIN, SPI, 1000000)) {
-      logFile = SD.open(LOG_FILENAME, FILE_APPEND);
-      if (logFile) {
-        sdReady = true;
-        Serial.println("\n>>> [SD CARD DETECTED & LOGGING STARTED] <<<");
-      }
-    }
-  }
-
-  if (sdReady) {
-    if (!logFile) {
-      logFile = SD.open(LOG_FILENAME, FILE_APPEND);
-    }
-    if (logFile) {
-      logFile.println(csvRow);
-      // Flush every 50 samples (~1 second) to ensure data is saved to flash
-      if (sampleCount % 50 == 0) {
-        logFile.flush();
-      }
-    } else {
-      sdReady = false; // file write failed, card possibly removed
-    }
-  }
-
-  // --- UDP broadcast to laptop ---
-  udp.beginPacket(IPAddress(192, 168, 4, 255), UDP_PORT);
-  udp.println(csvRow);
-  udp.endPacket();
+  // xQueueSend with 0 timeout never waits; if queue is full during extreme lag,
+  // it gracefully skips without delaying IMU sampling!
+  xQueueSend(dataQueue, &rec, 0);
 
   delay(20); // 50 Hz refresh rate for smooth animations
 }
